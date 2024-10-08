@@ -1,72 +1,81 @@
 package main
 
 import (
+	"fmt"
+	"unruggable-go/internal/ui"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
-	"unruggable-go/internal/ui"
 )
 
 func main() {
-	myApp := app.New()
+	myApp := app.NewWithID("com.unruggable.app")
 	myWindow := myApp.NewWindow("Unruggable")
 
-	// Initialize global state
-	state := ui.GetGlobalState()
+	var walletManager *ui.WalletManager
 
-	sidebar := ui.NewSidebar()
-	content := container.NewMax()
-
-	walletTabs := ui.NewWalletTabs(func(wallet string) {
-		state.SetSelectedWallet(wallet)
-		sidebar.OnHomeClicked() // Refresh home screen
+	walletTabs := ui.NewWalletTabs(func(walletID string) {
+		fmt.Println("Switched to wallet:", walletID)
+		if walletManager != nil {
+			walletManager.SetSelectedWallet(walletID)
+		}
 	})
 
-	// Load initial wallets
-	walletManager := ui.NewWalletManager(myWindow, walletTabs)
-	walletTabs.Update(walletManager.GetWallets())
+	walletManager = ui.NewWalletManager(myWindow, walletTabs, myApp)
 
-	mainContent := container.NewBorder(walletTabs.Container(), nil, nil, nil, content)
-	split := container.NewHSplit(sidebar, mainContent)
-	split.Offset = 0.2
+	// Create a container for the main content
+	mainContent := container.NewStack()
+
+	// Add the WalletTabs to the bottom of the screen
+	content := container.NewBorder(nil, walletTabs.Container(), nil, nil, mainContent)
+
+	sidebar := ui.NewSidebar()
+
+	split := container.NewHSplit(sidebar, content)
+	split.SetOffset(0.2)
 
 	myWindow.SetContent(split)
-	myWindow.Resize(fyne.NewSize(800, 600)) // Increased size for better visibility
+
+	updateMainContent := func(newContent fyne.CanvasObject) {
+		mainContent.RemoveAll()
+		mainContent.Add(newContent)
+	}
 
 	sidebar.OnHomeClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewHomeScreen()}
-		content.Refresh()
+		updateMainContent(ui.NewHomeScreen())
+		ui.GetGlobalState().SetCurrentView("home")
 	}
 	sidebar.OnWalletClicked = func() {
-		content.Objects = []fyne.CanvasObject{walletManager.NewWalletScreen()}
-		content.Refresh()
+		updateMainContent(walletManager.NewWalletScreen())
+		ui.GetGlobalState().SetCurrentView("wallet")
 	}
 	sidebar.OnAddressBookClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewAddressBookScreen()}
-		content.Refresh()
+		updateMainContent(ui.NewAddressBookScreen())
+		ui.GetGlobalState().SetCurrentView("addressbook")
 	}
 	sidebar.OnSwapClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewSwapScreen()}
-		content.Refresh()
+		updateMainContent(ui.NewSwapScreen())
+		ui.GetGlobalState().SetCurrentView("swap")
 	}
 	sidebar.OnBulkActionsClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewBulkActionsScreen()}
-		content.Refresh()
+		updateMainContent(ui.NewBulkActionsScreen())
+		ui.GetGlobalState().SetCurrentView("bulkactions")
 	}
 	sidebar.OnCalypsoClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewCalypsoScreen(myWindow)}
-		content.Refresh()
+		updateMainContent(ui.NewCalypsoScreen(myWindow))
+		ui.GetGlobalState().SetCurrentView("calypso")
 	}
 	sidebar.OnTxHistoryClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewTxHistoryScreen()}
-		content.Refresh()
+		updateMainContent(ui.NewTxHistoryScreen())
+		ui.GetGlobalState().SetCurrentView("txhistory")
 	}
 	sidebar.OnUnruggableClicked = func() {
-		content.Objects = []fyne.CanvasObject{ui.NewUnruggableScreen()}
-		content.Refresh()
+		updateMainContent(ui.NewUnruggableScreen())
+		ui.GetGlobalState().SetCurrentView("unruggable")
 	}
 
-	sidebar.OnHomeClicked() // Start with the home screen
+	sidebar.OnWalletClicked() // Start with the home screen
 
 	myWindow.ShowAndRun()
 }

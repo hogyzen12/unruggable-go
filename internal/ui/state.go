@@ -11,6 +11,7 @@ var (
 
 type AppState struct {
 	SelectedWallet string
+	CurrentView    string
 }
 
 func GetGlobalState() *AppState {
@@ -35,4 +36,18 @@ func (s *AppState) GetSelectedWallet() string {
 	defer globalStateLock.Unlock()
 
 	return s.SelectedWallet
+}
+
+func (s *AppState) SetCurrentView(view string) {
+	globalStateLock.Lock()
+	defer globalStateLock.Unlock()
+
+	s.CurrentView = view
+}
+
+func (s *AppState) GetCurrentView() string {
+	globalStateLock.Lock()
+	defer globalStateLock.Unlock()
+
+	return s.CurrentView
 }

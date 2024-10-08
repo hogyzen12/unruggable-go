@@ -19,45 +19,62 @@ import (
 	"github.com/gagliardetto/solana-go"
 )
 
-const walletStorageDir = "./wallets"
-
 type WalletManager struct {
 	window        fyne.Window
-	walletList    *widget.List
+	walletList    *container.Scroll
 	wallets       []string
 	currentWallet *widget.Label
 	walletTabs    *WalletTabs
+	app           fyne.App
 }
 
-func NewWalletManager(window fyne.Window, walletTabs *WalletTabs) *WalletManager {
+func NewWalletManager(window fyne.Window, walletTabs *WalletTabs, app fyne.App) *WalletManager {
 	manager := &WalletManager{
 		window:        window,
 		wallets:       []string{},
 		currentWallet: widget.NewLabel("No wallet selected"),
 		walletTabs:    walletTabs,
+		app:           app,
 	}
 	manager.loadSavedWallets()
+
+	// Set up the onSwitch function for walletTabs
+	walletTabs.onSwitch = func(walletID string) {
+		manager.SetSelectedWallet(walletID)
+	}
+
 	return manager
 }
 
-func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
-	m.walletList = widget.NewList(
-		func() int { return len(m.wallets) },
-		func() fyne.CanvasObject { return widget.NewLabel("template") },
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			item.(*widget.Label).SetText(m.wallets[id][:8] + "...")
-		},
-	)
+func (m *WalletManager) GetWalletsDirectory() string {
+	rootURI := m.app.Storage().RootURI()
+	userDir := rootURI.Path()
 
-	m.walletList.OnSelected = func(id widget.ListItemID) {
-		selectedWallet := m.wallets[id]
-		m.currentWallet.SetText("Selected wallet: " + selectedWallet)
-		GetGlobalState().SetSelectedWallet(selectedWallet)
-		m.walletTabs.Update(m.wallets) // Update tabs when a wallet is selected
+	// Create the "wallets" subdirectory if it doesn't exist
+	walletsDir := filepath.Join(userDir, "wallets")
+	if _, err := os.Stat(walletsDir); os.IsNotExist(err) {
+		os.MkdirAll(walletsDir, 0700)
 	}
 
+	return walletsDir
+}
+
+func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
+	walletItems := container.NewVBox()
+
+	for _, wallet := range m.wallets {
+		walletButton := widget.NewButton(wallet[:8]+"...", func() {
+			m.SetSelectedWallet(wallet)
+			GetGlobalState().SetSelectedWallet(wallet)
+		})
+		walletItems.Add(walletButton)
+	}
+
+	m.walletList = container.NewVScroll(walletItems)
+	m.walletList.SetMinSize(fyne.NewSize(200, 200))
+
 	importEntry := widget.NewPasswordEntry()
-	importEntry.SetPlaceHolder("Enter private key (base58)")
+	importEntry.SetPlaceHolder("Enter private key (Base58 or JSON Array)")
 
 	importButton := widget.NewButton("Import Wallet", func() {
 		m.importWallet(importEntry.Text)
@@ -79,15 +96,12 @@ func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
 	return container.NewBorder(controls, nil, nil, nil, m.walletList)
 }
 
-func (m *WalletManager) GetWallets() []string {
-	return m.wallets
-}
-
 func (m *WalletManager) loadSavedWallets() {
-	files, err := ioutil.ReadDir(walletStorageDir)
+	walletsDir := m.GetWalletsDirectory()
+	files, err := ioutil.ReadDir(walletsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			os.MkdirAll(walletStorageDir, 0700)
+			os.MkdirAll(walletsDir, 0700)
 		} else {
 			dialog.ShowError(fmt.Errorf("failed to read wallet directory: %v", err), m.window)
 		}
@@ -99,15 +113,16 @@ func (m *WalletManager) loadSavedWallets() {
 			m.wallets = append(m.wallets, strings.TrimSuffix(file.Name(), ".wallet"))
 		}
 	}
-	m.walletTabs.Update(m.wallets) // Update tabs after loading wallets
+
+	if m.walletTabs != nil {
+		m.walletTabs.Update(m.wallets)
+	} else {
+		fmt.Println("Warning: walletTabs is nil, skipping Update()")
+	}
 }
 
 func (m *WalletManager) importWallet(privateKey string) {
-	if privateKey == "" {
-		dialog.ShowError(fmt.Errorf("please enter a private key"), m.window)
-		return
-	}
-
+	// Use the private key to derive the wallet
 	wallet, err := solana.WalletFromPrivateKeyBase58(privateKey)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("invalid private key: %v", err), m.window)
@@ -167,12 +182,26 @@ func (m *WalletManager) generateWallet() {
 
 			m.wallets = append(m.wallets, pubKey)
 			m.walletList.Refresh()
-			m.walletTabs.Update(m.wallets) // Update tabs after generating a wallet
+			m.walletTabs.Update(m.wallets)
 			dialog.ShowInformation("Wallet Generated", fmt.Sprintf("New wallet generated and securely stored. Public Key: %s", pubKey), m.window)
 		}
 	}, m.window)
 
 	passwordDialog.Show()
+}
+
+func (m *WalletManager) SetSelectedWallet(walletID string) {
+	m.currentWallet.SetText("Selected wallet: " + walletID)
+	GetGlobalState().SetSelectedWallet(walletID)
+
+	// Update the UI to reflect the selected wallet
+	if m.walletTabs != nil {
+		m.walletTabs.SetSelectedWallet(walletID)
+	}
+}
+
+func (m *WalletManager) GetWallets() []string {
+	return m.wallets
 }
 
 func (m *WalletManager) saveEncryptedWallet(pubKey, privateKey, password string) error {
@@ -181,8 +210,20 @@ func (m *WalletManager) saveEncryptedWallet(pubKey, privateKey, password string)
 		return err
 	}
 
-	filename := filepath.Join(walletStorageDir, pubKey+".wallet")
-	return ioutil.WriteFile(filename, []byte(encryptedKey), 0600)
+	walletsDir := m.GetWalletsDirectory()
+	filename := filepath.Join(walletsDir, pubKey+".wallet")
+
+	if err := ioutil.WriteFile(filename, []byte(encryptedKey), 0600); err != nil {
+		return err
+	}
+
+	// Add new wallet to list and update WalletTabs
+	m.wallets = append(m.wallets, pubKey)
+	if m.walletTabs != nil {
+		m.walletTabs.Update(m.wallets)
+	}
+
+	return nil
 }
 
 func encrypt(data []byte, passphrase string) (string, error) {
