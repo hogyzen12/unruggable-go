@@ -71,7 +71,7 @@ func main() {
 		ui.GetGlobalState().SetCurrentView("txhistory")
 	}
 	sidebar.OnUnruggableClicked = func() {
-		updateMainContent(ui.NewUnruggableScreen())
+		updateMainContent(ui.NewUnruggableScreen(myWindow, myApp))
 		ui.GetGlobalState().SetCurrentView("unruggable")
 	}
 

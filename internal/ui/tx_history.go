@@ -38,7 +38,7 @@ func fetchTransactionHistory(walletAddress string) ([]Transaction, error) {
 	}
 	transactionCacheMutex.RUnlock()
 
-	url := fmt.Sprintf("http://localhost:3000/api/solana/%s/transactions", walletAddress)
+	url := fmt.Sprintf("https://unruggable-api.fly.dev/api/solana/%s/transactions", walletAddress)
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, err

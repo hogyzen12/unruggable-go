@@ -23,7 +23,7 @@ var (
 
 const tokenListURL = "https://tokens.jup.ag/tokens?tags=verified"
 const tokenListCacheDuration = 1 * time.Hour
-const RPC_ENDPOINT = "http://localhost:3000/api/solana/"
+const RPC_ENDPOINT = "https://unruggable-api.fly.dev/api/solana/"
 
 // TokenWidget is a custom widget to display token information
 type TokenWidget struct {
