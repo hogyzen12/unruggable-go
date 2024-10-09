@@ -45,6 +45,10 @@ Check out the demo of the MPC/Distributed Key Generation in action:
 
 https://shdw-drive.genesysgo.net/3UgjUKQ1CAeaecg5CWk88q9jGHg8LJg9MAybp4pevtFz/Unruggable_MPC_demo.mp4
 
+Pitch Demo
+
+https://www.loom.com/share/ca5dd6ff4d1e49d286da74367c20734b?sid=f0d9bbc0-bb9a-404e-9b73-171ed729a6f8
+
 This demo showcases how our distributed key generation works to protect your assets.
 
 Contributing
