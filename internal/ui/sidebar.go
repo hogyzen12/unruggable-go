@@ -8,14 +8,16 @@ import (
 
 type Sidebar struct {
 	widget.BaseWidget
-	OnHomeClicked       func()
-	OnWalletClicked     func()
+	OnHomeClicked        func()
+	OnWalletClicked      func()
 	OnAddressBookClicked func()
-	OnSwapClicked       func()
+	OnTxHistoryClicked   func()
+	OnSwapClicked        func()
 	OnBulkActionsClicked func()
-	OnCalypsoClicked    func()
-	OnTxHistoryClicked  func()
-	OnUnruggableClicked func()
+	OnCalypsoClicked     func()
+	OnUnruggableClicked  func()
+	OnKeygenClicked      func()
+	OnSigningClicked     func()
 }
 
 func NewSidebar() *Sidebar {
@@ -40,6 +42,11 @@ func (s *Sidebar) CreateRenderer() fyne.WidgetRenderer {
 			s.OnAddressBookClicked()
 		}
 	})
+	txHistoryBtn := widget.NewButton("TX History", func() {
+		if s.OnTxHistoryClicked != nil {
+			s.OnTxHistoryClicked()
+		}
+	})
 	swapBtn := widget.NewButton("Swap", func() {
 		if s.OnSwapClicked != nil {
 			s.OnSwapClicked()
@@ -55,17 +62,22 @@ func (s *Sidebar) CreateRenderer() fyne.WidgetRenderer {
 			s.OnCalypsoClicked()
 		}
 	})
-	txHistoryBtn := widget.NewButton("TX History", func() {
-		if s.OnTxHistoryClicked != nil {
-			s.OnTxHistoryClicked()
-		}
-	})
 	unruggableBtn := widget.NewButton("Unruggable", func() {
 		if s.OnUnruggableClicked != nil {
 			s.OnUnruggableClicked()
 		}
 	})
+	keygenBtn := widget.NewButton("Keygen", func() {
+		if s.OnKeygenClicked != nil {
+			s.OnKeygenClicked()
+		}
+	})
+	signingBtn := widget.NewButton("Signing", func() {
+		if s.OnSigningClicked != nil {
+			s.OnSigningClicked()
+		}
+	})
 
-	content := container.NewVBox(homeBtn, walletBtn, addressBookBtn, swapBtn, bulkActionsBtn, calypsoBtn, txHistoryBtn, unruggableBtn)
+	content := container.NewVBox(homeBtn, walletBtn, addressBookBtn, txHistoryBtn, swapBtn, bulkActionsBtn, calypsoBtn, unruggableBtn, keygenBtn, signingBtn)
 	return widget.NewSimpleRenderer(content)
 }

@@ -54,6 +54,10 @@ func main() {
 		updateMainContent(ui.NewAddressBookScreen())
 		ui.GetGlobalState().SetCurrentView("addressbook")
 	}
+	sidebar.OnTxHistoryClicked = func() {
+		updateMainContent(ui.NewTxHistoryScreen())
+		ui.GetGlobalState().SetCurrentView("txhistory")
+	}
 	sidebar.OnSwapClicked = func() {
 		updateMainContent(ui.NewSwapScreen())
 		ui.GetGlobalState().SetCurrentView("swap")
@@ -66,13 +70,17 @@ func main() {
 		updateMainContent(ui.NewCalypsoScreen(myWindow))
 		ui.GetGlobalState().SetCurrentView("calypso")
 	}
-	sidebar.OnTxHistoryClicked = func() {
-		updateMainContent(ui.NewTxHistoryScreen())
-		ui.GetGlobalState().SetCurrentView("txhistory")
-	}
 	sidebar.OnUnruggableClicked = func() {
 		updateMainContent(ui.NewUnruggableScreen(myWindow, myApp))
 		ui.GetGlobalState().SetCurrentView("unruggable")
+	}
+	sidebar.OnKeygenClicked = func() {
+		updateMainContent(ui.NewKeygenScreen(myWindow, myApp))
+		ui.GetGlobalState().SetCurrentView("keygen")
+	}
+	sidebar.OnSigningClicked = func() {
+		updateMainContent(ui.NewSigningScreen(myWindow, myApp))
+		ui.GetGlobalState().SetCurrentView("signing")
 	}
 
 	sidebar.OnWalletClicked() // Start with the home screen
