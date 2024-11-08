@@ -239,10 +239,3 @@ func encrypt(data []byte, passphrase string) (string, error) {
 	ciphertext := gcm.Seal(nonce, nonce, data, nil)
 	return hex.EncodeToString(ciphertext), nil
 }
-
-func padKey(key string) string {
-	for len(key) < 32 {
-		key += key
-	}
-	return key[:32]
-}

@@ -87,3 +87,10 @@ func jsonEncode(v interface{}) *bytes.Buffer {
 	json.NewEncoder(buf).Encode(v)
 	return buf
 }
+
+func padKey(key string) string {
+	for len(key) < 32 {
+		key += key
+	}
+	return key[:32]
+}

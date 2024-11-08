@@ -67,7 +67,7 @@ func main() {
 		ui.GetGlobalState().SetCurrentView("bulkactions")
 	}
 	sidebar.OnCalypsoClicked = func() {
-		updateMainContent(ui.NewCalypsoScreen(myWindow))
+		updateMainContent(ui.NewCalypsoScreen(myWindow, myApp))
 		ui.GetGlobalState().SetCurrentView("calypso")
 	}
 	sidebar.OnUnruggableClicked = func() {

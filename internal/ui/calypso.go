@@ -3,7 +3,10 @@ package ui
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -11,12 +14,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/programs/system"
@@ -43,10 +48,10 @@ type PythPriceResponse struct {
 
 var ASSETS = map[string]Asset{
 	"USDC": {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6, decimal.NewFromFloat(0.2)},
-	"JTO":  {"jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL", 9, decimal.NewFromFloat(0.1)},
-	"SOL":  {"So11111111111111111111111111111111111111112", 9, decimal.NewFromFloat(0.2)},
+	"JTO":  {"jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL", 9, decimal.NewFromFloat(0.0)},
+	"SOL":  {"So11111111111111111111111111111111111111112", 9, decimal.NewFromFloat(0.4)},
 	"JUP":  {"JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", 6, decimal.NewFromFloat(0.1)},
-	"JLP":  {"27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", 6, decimal.NewFromFloat(0.2)},
+	"JLP":  {"27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", 6, decimal.NewFromFloat(0.3)},
 }
 
 var TOKEN_IDS = map[string]string{
@@ -68,7 +73,7 @@ const (
 	JUPITER_QUOTE_URL         = "https://quote-api.jup.ag/v6/quote"
 	JUPITER_SWAP_INSTRUCTIONS = "https://quote-api.jup.ag/v6/swap-instructions"
 	JITO_BUNDLE_URL           = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
-	CLPSO_ENDPOINT            = "https://mainnet.helius-rpc.com/?api-key=2c0388dc-a082-4cc5-bad9-29437f3c0715"
+	CLPSO_ENDPOINT            = "https://mainnet.helius-rpc.com/?api-key=001ad922-c61a-4dce-9097-6f8684b0f8c7"
 )
 
 var (
@@ -94,9 +99,18 @@ type CalypsoBot struct {
 	client             *rpc.Client
 	fromAccount        *solana.PrivateKey
 	retryDelay         time.Duration
+	walletSelect       *widget.Select
+	stashSelect        *widget.Select
+	app                fyne.App
+	container          *fyne.Container
+	stashInput         *widget.Entry            // New field for manual stash address input
+	allocations        map[string]*widget.Entry // New field to track allocation inputs
+	allocationStatus   *widget.Label            // Shows allocation total status
+	startButtonEnabled bool                     // Tracks if bot can be started
+	validationIcons    map[string]*widget.Label // Visual indicators for each asset
 }
 
-func NewCalypsoScreen(window fyne.Window) fyne.CanvasObject {
+func NewCalypsoScreen(window fyne.Window, app fyne.App) fyne.CanvasObject {
 	bot := &CalypsoBot{
 		window:             window,
 		status:             widget.NewLabel("Bot Status: Stopped"),
@@ -106,22 +120,121 @@ func NewCalypsoScreen(window fyne.Window) fyne.CanvasObject {
 		rebalanceThreshold: REBALANCE_THRESHOLD,
 		stashThreshold:     STASH_THRESHOLD,
 		stashAmount:        STASH_AMOUNT,
-		stashAddress:       STASH_ADDRESS,
 		client:             rpc.New(CLPSO_ENDPOINT),
 		retryDelay:         INITIAL_RETRY_DELAY,
+		app:                app,
+		allocationStatus:   widget.NewLabel(""),
+		startButtonEnabled: false,
+		validationIcons:    make(map[string]*widget.Label),
+		allocations:        make(map[string]*widget.Entry),
 	}
 
+	// Initialize startStopButton early
 	bot.startStopButton = widget.NewButton("Start Bot", bot.toggleBot)
-	bot.log.Disable()
+	bot.startStopButton.Disable() // Start disabled until validation passes
 
+	bot.log.Disable()
+	bot.log.SetMinRowsVisible(9)
+
+	// Get available wallets
+	wallets, err := bot.listWalletFiles()
+	if err != nil {
+		bot.logMessage(fmt.Sprintf("Error listing wallet files: %v", err))
+		wallets = []string{}
+	}
+
+	// Operating wallet selector
+	bot.walletSelect = widget.NewSelect(wallets, func(value string) {
+		bot.loadSelectedWallet(value)
+	})
+	bot.walletSelect.PlaceHolder = "Select Operating Wallet"
+
+	// Stash address input with horizontal radio selection
+	stashMethodRadio := widget.NewRadioGroup([]string{"Select from Wallets", "Enter Address"}, func(value string) {
+		if value == "Select from Wallets" {
+			bot.stashSelect.Show()
+			bot.stashInput.Hide()
+		} else {
+			bot.stashSelect.Hide()
+			bot.stashInput.Show()
+		}
+	})
+	stashMethodRadio.Horizontal = true
+	bot.startStopButton = widget.NewButton("Start Bot", bot.toggleBot)
+
+	bot.stashSelect = widget.NewSelect(wallets, func(value string) {
+		if pubKey, err := bot.getPublicKeyFromWallet(value); err == nil {
+			bot.stashAddress = pubKey
+			bot.logMessage(fmt.Sprintf("Set stash address to: %s", pubKey))
+		}
+	})
+	bot.stashSelect.PlaceHolder = "Select Stash Wallet"
+
+	bot.stashInput = widget.NewEntry()
+	bot.stashInput.SetPlaceHolder("Enter Solana address")
+	bot.stashInput.OnChanged = func(value string) {
+		if value != "" {
+			bot.stashAddress = value
+			bot.logMessage(fmt.Sprintf("Set custom stash address to: %s", value))
+		}
+	}
+	bot.stashInput.Hide()
+
+	stashMethodRadio.SetSelected("Select from Wallets")
+
+	allocationsContainer := container.NewGridWithColumns(3) // Changed to 3 columns to include status icons
+	allocationsContainer.Add(widget.NewLabelWithStyle("Asset", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}))
+	allocationsContainer.Add(widget.NewLabelWithStyle("Allocation (%)", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
+	allocationsContainer.Add(widget.NewLabelWithStyle("Status", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}))
+
+	for asset := range ASSETS {
+		// Asset name
+		allocationsContainer.Add(widget.NewLabelWithStyle(asset, fyne.TextAlignLeading, fyne.TextStyle{}))
+
+		// Allocation input
+		entry := widget.NewEntry()
+		entry.SetText(ASSETS[asset].Allocation.Mul(decimal.NewFromFloat(100)).String())
+		entry.OnChanged = func(asset string) func(string) {
+			return func(value string) {
+				if alloc, err := decimal.NewFromString(value); err == nil {
+					details := ASSETS[asset]
+					details.Allocation = alloc.Div(decimal.NewFromFloat(100))
+					ASSETS[asset] = details
+					bot.validateAndUpdateAllocations()
+				} else {
+					bot.validationIcons[asset].SetText("❌")
+					bot.updateStartButtonState(false)
+				}
+			}
+		}(asset)
+		bot.allocations[asset] = entry
+		allocationsContainer.Add(entry)
+
+		// Status icon
+		statusIcon := widget.NewLabel("✓")
+		bot.validationIcons[asset] = statusIcon
+		allocationsContainer.Add(statusIcon)
+	}
+
+	// Add allocation total status below the allocations
+	bot.allocationStatus.TextStyle = fyne.TextStyle{Bold: true}
+	bot.validateAndUpdateAllocations() // Initial validation
+
+	// Create bot settings section
+	settingsContainer := container.NewGridWithColumns(2)
+
+	// Settings labels
+	settingsContainer.Add(widget.NewLabelWithStyle("Check Interval (seconds)", fyne.TextAlignLeading, fyne.TextStyle{}))
 	checkIntervalEntry := widget.NewEntry()
-	checkIntervalEntry.SetText(strconv.Itoa(bot.checkInterval))
+	checkIntervalEntry.SetText(fmt.Sprintf("%d", bot.checkInterval))
 	checkIntervalEntry.OnChanged = func(value string) {
-		if interval, err := strconv.Atoi(value); err == nil {
+		if interval, _ := strconv.Atoi(value); interval > 0 {
 			bot.checkInterval = interval
 		}
 	}
+	settingsContainer.Add(checkIntervalEntry)
 
+	settingsContainer.Add(widget.NewLabelWithStyle("Rebalance Threshold", fyne.TextAlignLeading, fyne.TextStyle{}))
 	rebalanceThresholdEntry := widget.NewEntry()
 	rebalanceThresholdEntry.SetText(bot.rebalanceThreshold.String())
 	rebalanceThresholdEntry.OnChanged = func(value string) {
@@ -129,7 +242,9 @@ func NewCalypsoScreen(window fyne.Window) fyne.CanvasObject {
 			bot.rebalanceThreshold = threshold
 		}
 	}
+	settingsContainer.Add(rebalanceThresholdEntry)
 
+	settingsContainer.Add(widget.NewLabelWithStyle("Stash Threshold ($)", fyne.TextAlignLeading, fyne.TextStyle{}))
 	stashThresholdEntry := widget.NewEntry()
 	stashThresholdEntry.SetText(bot.stashThreshold.String())
 	stashThresholdEntry.OnChanged = func(value string) {
@@ -137,7 +252,9 @@ func NewCalypsoScreen(window fyne.Window) fyne.CanvasObject {
 			bot.stashThreshold = threshold
 		}
 	}
+	settingsContainer.Add(stashThresholdEntry)
 
+	settingsContainer.Add(widget.NewLabelWithStyle("Stash Amount ($)", fyne.TextAlignLeading, fyne.TextStyle{}))
 	stashAmountEntry := widget.NewEntry()
 	stashAmountEntry.SetText(bot.stashAmount.String())
 	stashAmountEntry.OnChanged = func(value string) {
@@ -145,57 +262,176 @@ func NewCalypsoScreen(window fyne.Window) fyne.CanvasObject {
 			bot.stashAmount = amount
 		}
 	}
+	settingsContainer.Add(stashAmountEntry)
 
-	stashAddressEntry := widget.NewEntry()
-	stashAddressEntry.SetText(bot.stashAddress)
-	stashAddressEntry.OnChanged = func(value string) {
-		bot.stashAddress = value
-	}
+	allocationsContent := container.NewVBox(
+		container.NewPadded(allocationsContainer),
+		container.NewPadded(bot.allocationStatus),
+	)
 
-	assetList := container.NewVBox()
-	for name, asset := range ASSETS {
-		label := widget.NewLabel(name + " Allocation:")
-		entry := widget.NewEntry()
-		entry.SetText(asset.Allocation.String())
-		assetName := name
-		entry.OnChanged = func(newValue string) {
-			if alloc, err := decimal.NewFromString(newValue); err == nil {
-				updatedAsset := ASSETS[assetName]
-				updatedAsset.Allocation = alloc
-				ASSETS[assetName] = updatedAsset
-			} else {
-				log.Println("Invalid allocation value for", assetName)
-			}
-		}
-		assetList.Add(container.NewHBox(label, entry))
-	}
+	// Create a horizontal container for allocations and settings
+	configContainer := container.NewHSplit(
+		widget.NewCard("Asset Allocations", "", allocationsContent),
+		widget.NewCard("Bot Settings", "", container.NewPadded(settingsContainer)),
+	)
+	configContainer.SetOffset(0.5) // Set the split to be 50/50
 
-	return container.NewVBox(
-		widget.NewLabel("Calypso Trading Bot"),
-		bot.status,
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Check Interval (seconds):"),
-			checkIntervalEntry,
-			widget.NewLabel("Rebalance Threshold:"),
-			rebalanceThresholdEntry,
-			widget.NewLabel("Stash Threshold ($):"),
-			stashThresholdEntry,
-			widget.NewLabel("Stash Amount ($):"),
-			stashAmountEntry,
-			widget.NewLabel("Stash Address:"),
-			stashAddressEntry,
+	// Main layout
+	bot.container = container.NewVBox(
+		widget.NewCard(
+			"Wallet Selection",
+			"",
+			container.NewPadded(bot.walletSelect),
 		),
-		assetList,
+		widget.NewCard(
+			"Stash Configuration",
+			"",
+			container.NewVBox(
+				container.NewPadded(stashMethodRadio),
+				container.NewPadded(bot.stashSelect),
+				container.NewPadded(bot.stashInput),
+			),
+		),
+		configContainer,
 		bot.startStopButton,
-		widget.NewLabel("Bot Log:"),
+		bot.status,
 		bot.log,
 	)
+
+	// Run initial validation after everything is set up
+	bot.validateAndUpdateAllocations()
+
+	return bot.container
+}
+
+func (b *CalypsoBot) listWalletFiles() ([]string, error) {
+	walletsDir := filepath.Join(b.app.Storage().RootURI().Path(), "wallets")
+	files, err := ioutil.ReadDir(walletsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var walletFiles []string
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".wallet") {
+			walletFiles = append(walletFiles, strings.TrimSuffix(file.Name(), ".wallet"))
+		}
+	}
+	return walletFiles, nil
+}
+
+func (b *CalypsoBot) loadSelectedWallet(walletID string) {
+	walletsDir := filepath.Join(b.app.Storage().RootURI().Path(), "wallets")
+	filename := filepath.Join(walletsDir, walletID+".wallet")
+
+	// Read the encrypted wallet file
+	encryptedData, err := ioutil.ReadFile(filename)
+	if err != nil {
+		b.logMessage(fmt.Sprintf("Error reading wallet file: %v", err))
+		return
+	}
+
+	// Prompt for password
+	passwordEntry := widget.NewPasswordEntry()
+	passwordEntry.SetPlaceHolder("Enter wallet password")
+
+	dialog.ShowCustomConfirm("Decrypt Wallet", "Unlock", "Cancel", passwordEntry, func(unlock bool) {
+		if !unlock {
+			return
+		}
+
+		decryptedKey, err := decrypt(string(encryptedData), passwordEntry.Text)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("Failed to decrypt wallet: %v", err), b.window)
+			return
+		}
+
+		// Convert the decrypted private key to a Solana private key
+		privateKey := solana.MustPrivateKeyFromBase58(string(decryptedKey))
+		b.fromAccount = &privateKey
+
+		b.logMessage(fmt.Sprintf("Loaded wallet with public key: %s", privateKey.PublicKey().String()))
+	}, b.window)
+}
+
+func (b *CalypsoBot) getPublicKeyFromWallet(walletID string) (string, error) {
+	walletsDir := filepath.Join(b.app.Storage().RootURI().Path(), "wallets")
+	filename := filepath.Join(walletsDir, walletID+".wallet")
+
+	// Read the wallet file
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+
+	// Parse the wallet data to get the public key
+	var walletData struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(data, &walletData); err != nil {
+		return "", err
+	}
+
+	return walletData.PublicKey, nil
+}
+
+func (b *CalypsoBot) validateAndUpdateAllocations() {
+	total := decimal.Zero
+	allValid := true
+
+	// Calculate total and validate individual entries
+	for asset, entry := range b.allocations {
+		value, err := decimal.NewFromString(entry.Text)
+		if err != nil || value.IsNegative() {
+			b.validationIcons[asset].SetText("❌")
+			allValid = false
+			continue
+		}
+
+		total = total.Add(value)
+
+		// Update icon based on individual value validity
+		if value.IsPositive() || value.IsZero() {
+			b.validationIcons[asset].SetText("✓")
+		} else {
+			b.validationIcons[asset].SetText("❌")
+			allValid = false
+		}
+	}
+
+	// Update total status
+	if total.Equal(decimal.NewFromFloat(100)) {
+		b.allocationStatus.SetText(fmt.Sprintf("Total Allocation: %.1f%% ✓", total.InexactFloat64()))
+		if allValid {
+			b.updateStartButtonState(true)
+			return
+		}
+	} else {
+		b.allocationStatus.SetText(fmt.Sprintf("Total Allocation: %.1f%% ❌ (Must equal 100%%)", total.InexactFloat64()))
+	}
+
+	b.updateStartButtonState(false)
+}
+
+func (b *CalypsoBot) updateStartButtonState(enabled bool) {
+	b.startButtonEnabled = enabled
+	if b.startStopButton != nil { // Add nil check
+		if enabled {
+			b.startStopButton.Enable()
+		} else {
+			b.startStopButton.Disable()
+		}
+	}
 }
 
 func (b *CalypsoBot) toggleBot() {
 	if b.isRunning {
 		b.stopBot()
 	} else {
+		if !b.startButtonEnabled {
+			dialog.ShowError(fmt.Errorf("Cannot start bot: Invalid allocations"), b.window)
+			return
+		}
 		b.startBot()
 	}
 }
@@ -508,14 +744,6 @@ func (b *CalypsoBot) printTrades(trades []Trade) {
 	b.logMessage(strings.Repeat("-", 70))
 }
 
-func (b *CalypsoBot) executeTransactions(trades []Trade, stashAmount decimal.Decimal) error {
-	// In a real implementation, you would create and send Solana transactions here
-	// For this example, we'll just simulate the process
-	b.logMessage("Simulating transaction execution...")
-	time.Sleep(2 * time.Second)
-	return nil
-}
-
 func (b *CalypsoBot) verifyTransactions(doubleStashTriggered bool) {
 	b.logMessage("Waiting for 15 seconds before verifying the transactions...")
 	time.Sleep(15 * time.Second)
@@ -595,6 +823,37 @@ func loadKeypair(path string) (*solana.PrivateKey, error) {
 
 	privateKey := solana.PrivateKey(secretKey)
 	return &privateKey, nil
+}
+
+func decrypt(encryptedData string, password string) ([]byte, error) {
+	key := []byte(padKey(password))
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	ciphertext, err := hex.DecodeString(encryptedData)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize()
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
 }
 
 func (b *CalypsoBot) getJupiterSwapInstructions(fromAccountPublicKey solana.PublicKey, inputMint, outputMint string, amountLamports int64, slippageBps int) (map[string]interface{}, error) {
