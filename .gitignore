@@ -1,5 +1,10 @@
 Unruggable.app.app
-wallets/*
-.DS_Store
 Unruggable_apk.apk
+.DS_Store
 Unruggable-app.app
+selfsigned.crt
+selfsigned.key
+selfsigned.pfx
+Unruggable.zip
+wasm/*
+
