@@ -1,3 +1,4 @@
+releases/*
 Unruggable.app.app
 Unruggable_apk.apk
 .DS_Store
@@ -8,3 +9,9 @@ selfsigned.pfx
 Unruggable.zip
 wasm/*
 
+release-key.jks
+unruggable_go.aab
+repo-structure.txt
+pepk.jar
+output.zip
+encryption_public_key.pem
