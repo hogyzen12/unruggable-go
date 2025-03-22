@@ -14,10 +14,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unruggable-go/internal/storage"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -36,7 +37,7 @@ type Asset struct {
 	Allocation decimal.Decimal
 }
 
-type PythPriceResponse struct {
+type CalypsoPythPriceResponse struct {
 	Parsed []struct {
 		ID    string `json:"id"`
 		Price struct {
@@ -304,30 +305,41 @@ func NewCalypsoScreen(window fyne.Window, app fyne.App) fyne.CanvasObject {
 	return bot.container
 }
 
+// Updated methods for calypso.go
+
 func (b *CalypsoBot) listWalletFiles() ([]string, error) {
-	walletsDir := filepath.Join(b.app.Storage().RootURI().Path(), "wallets")
-	files, err := ioutil.ReadDir(walletsDir)
+	// Use the storage abstraction to get wallets
+	walletStorage := storage.NewWalletStorage(b.app)
+	walletMap, err := walletStorage.LoadWallets()
 	if err != nil {
 		return nil, err
 	}
 
+	// Extract wallet IDs from the map
 	var walletFiles []string
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".wallet") {
-			walletFiles = append(walletFiles, strings.TrimSuffix(file.Name(), ".wallet"))
-		}
+	for walletID := range walletMap {
+		walletFiles = append(walletFiles, walletID)
 	}
+
+	// Sort wallets for consistent display
+	sort.Strings(walletFiles)
+
 	return walletFiles, nil
 }
 
 func (b *CalypsoBot) loadSelectedWallet(walletID string) {
-	walletsDir := filepath.Join(b.app.Storage().RootURI().Path(), "wallets")
-	filename := filepath.Join(walletsDir, walletID+".wallet")
-
-	// Read the encrypted wallet file
-	encryptedData, err := ioutil.ReadFile(filename)
+	// Use the storage abstraction to access wallet data
+	walletStorage := storage.NewWalletStorage(b.app)
+	walletMap, err := walletStorage.LoadWallets()
 	if err != nil {
-		b.logMessage(fmt.Sprintf("Error reading wallet file: %v", err))
+		b.logMessage(fmt.Sprintf("Error loading wallets: %v", err))
+		return
+	}
+
+	// Get the encrypted wallet data
+	encryptedData, ok := walletMap[walletID]
+	if !ok {
+		b.logMessage(fmt.Sprintf("Wallet %s not found", walletID))
 		return
 	}
 
@@ -340,7 +352,7 @@ func (b *CalypsoBot) loadSelectedWallet(walletID string) {
 			return
 		}
 
-		decryptedKey, err := decrypt(string(encryptedData), passwordEntry.Text)
+		decryptedKey, err := decrypt(encryptedData, passwordEntry.Text)
 		if err != nil {
 			dialog.ShowError(fmt.Errorf("Failed to decrypt wallet: %v", err), b.window)
 			return
@@ -355,24 +367,9 @@ func (b *CalypsoBot) loadSelectedWallet(walletID string) {
 }
 
 func (b *CalypsoBot) getPublicKeyFromWallet(walletID string) (string, error) {
-	walletsDir := filepath.Join(b.app.Storage().RootURI().Path(), "wallets")
-	filename := filepath.Join(walletsDir, walletID+".wallet")
-
-	// Read the wallet file
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return "", err
-	}
-
-	// Parse the wallet data to get the public key
-	var walletData struct {
-		PublicKey string `json:"public_key"`
-	}
-	if err := json.Unmarshal(data, &walletData); err != nil {
-		return "", err
-	}
-
-	return walletData.PublicKey, nil
+	// This method seems like it's trying to extract the public key from the wallet file
+	// In your storage system, the wallet ID itself is the public key, so we can just return it
+	return walletID, nil
 }
 
 func (b *CalypsoBot) validateAndUpdateAllocations() {
@@ -568,7 +565,7 @@ func (b *CalypsoBot) getWalletBalances(walletAddress string) (map[string]decimal
 	b.logMessage("Raw RPC Response:")
 	b.logMessage(string(bodyBytes))
 
-	var response AssetsResponse
+	var response CalypsoAssetsResponse
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %v", err)
 	}
@@ -638,7 +635,7 @@ func (b *CalypsoBot) getPrices() (map[string]decimal.Decimal, error) {
 	defer resp.Body.Close()
 
 	// Parse the response
-	var pythResp PythPriceResponse
+	var pythResp CalypsoPythPriceResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pythResp); err != nil {
 		return nil, fmt.Errorf("failed to decode price response: %v", err)
 	}

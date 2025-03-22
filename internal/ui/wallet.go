@@ -7,16 +7,15 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"strings"
+	"sort"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gagliardetto/solana-go"
+
+	"unruggable-go/internal/storage"
 )
 
 type WalletManager struct {
@@ -26,6 +25,7 @@ type WalletManager struct {
 	currentWallet *widget.Label
 	walletTabs    *WalletTabs
 	app           fyne.App
+	storage       storage.WalletStorage
 }
 
 func NewWalletManager(window fyne.Window, walletTabs *WalletTabs, app fyne.App) *WalletManager {
@@ -35,7 +35,11 @@ func NewWalletManager(window fyne.Window, walletTabs *WalletTabs, app fyne.App) 
 		currentWallet: widget.NewLabel("No wallet selected"),
 		walletTabs:    walletTabs,
 		app:           app,
+		// Create the appropriate WalletStorage based on build tags.
+		storage: storage.NewWalletStorage(app),
 	}
+
+	// Load wallets immediately
 	manager.loadSavedWallets()
 
 	// Set up the onSwitch function for walletTabs
@@ -43,30 +47,45 @@ func NewWalletManager(window fyne.Window, walletTabs *WalletTabs, app fyne.App) 
 		manager.SetSelectedWallet(walletID)
 	}
 
+	// Check if there's already a selected wallet in global state
+	if selectedWallet := GetGlobalState().GetSelectedWallet(); selectedWallet != "" {
+		// Verify that the selected wallet exists in our loaded wallets
+		for _, wallet := range manager.wallets {
+			if wallet == selectedWallet {
+				manager.SetSelectedWallet(selectedWallet)
+				break
+			}
+		}
+	} else if len(manager.wallets) > 0 {
+		// If no wallet is selected but wallets exist, select the first one
+		manager.SetSelectedWallet(manager.wallets[0])
+	}
+
 	return manager
 }
 
-func (m *WalletManager) GetWalletsDirectory() string {
-	rootURI := m.app.Storage().RootURI()
-	userDir := rootURI.Path()
-
-	// Create the "wallets" subdirectory if it doesn't exist
-	walletsDir := filepath.Join(userDir, "wallets")
-	if _, err := os.Stat(walletsDir); os.IsNotExist(err) {
-		os.MkdirAll(walletsDir, 0700)
-	}
-
-	return walletsDir
-}
-
+// NewWalletScreen creates the UI for wallet management.
 func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
+	// Create a refresh button to reload wallets
+	refreshButton := widget.NewButton("Refresh Wallets", func() {
+		m.loadSavedWallets()
+	})
+
 	walletItems := container.NewVBox()
 
+	// Create a button for each wallet.
 	for _, wallet := range m.wallets {
-		walletButton := widget.NewButton(wallet[:8]+"...", func() {
-			m.SetSelectedWallet(wallet)
-			GetGlobalState().SetSelectedWallet(wallet)
-		})
+		walletButton := widget.NewButton(wallet[:8]+"...", func(wlt string) func() {
+			return func() {
+				m.SetSelectedWallet(wlt)
+			}
+		}(wallet))
+
+		// Highlight the currently selected wallet
+		if wallet == GetGlobalState().GetSelectedWallet() {
+			walletButton.Importance = widget.HighImportance
+		}
+
 		walletItems.Add(walletButton)
 	}
 
@@ -78,7 +97,7 @@ func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
 
 	importButton := widget.NewButton("Import Wallet", func() {
 		m.importWallet(importEntry.Text)
-		importEntry.SetText("") // Clear the entry for security
+		importEntry.SetText("") // Clear for security
 	})
 
 	generateButton := widget.NewButton("Generate New Wallet", func() {
@@ -88,8 +107,8 @@ func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
 	controls := container.NewVBox(
 		widget.NewLabel("Wallet Management"),
 		m.currentWallet,
-		importEntry,
-		importButton,
+		refreshButton,
+		container.NewHBox(importEntry, importButton),
 		generateButton,
 	)
 
@@ -97,62 +116,132 @@ func (m *WalletManager) NewWalletScreen() fyne.CanvasObject {
 }
 
 func (m *WalletManager) loadSavedWallets() {
-	walletsDir := m.GetWalletsDirectory()
-	files, err := ioutil.ReadDir(walletsDir)
+	walletMap, err := m.storage.LoadWallets()
 	if err != nil {
-		if os.IsNotExist(err) {
-			os.MkdirAll(walletsDir, 0700)
-		} else {
-			dialog.ShowError(fmt.Errorf("failed to read wallet directory: %v", err), m.window)
-		}
+		dialog.ShowError(fmt.Errorf("failed to load wallets: %v", err), m.window)
 		return
 	}
 
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".wallet") {
-			m.wallets = append(m.wallets, strings.TrimSuffix(file.Name(), ".wallet"))
+	// Clear existing wallets list
+	m.wallets = []string{}
+
+	// Add wallets from the storage
+	for pubKey := range walletMap {
+		m.wallets = append(m.wallets, pubKey)
+	}
+
+	// Sort wallets for consistent display
+	sort.Strings(m.wallets)
+
+	// Update UI
+	if m.walletTabs != nil {
+		m.walletTabs.Update(m.wallets)
+	}
+
+	// Update wallet list if it exists
+	if m.walletList != nil {
+		m.walletList.Content = m.createWalletItemsList()
+		m.walletList.Refresh()
+	}
+
+	// Check if the currently selected wallet still exists
+	currentSelection := GetGlobalState().GetSelectedWallet()
+	walletExists := false
+
+	for _, wallet := range m.wallets {
+		if wallet == currentSelection {
+			walletExists = true
+			break
 		}
 	}
 
-	if m.walletTabs != nil {
-		m.walletTabs.Update(m.wallets)
-	} else {
-		fmt.Println("Warning: walletTabs is nil, skipping Update()")
+	// If the selected wallet no longer exists, clear it or select a different one
+	if !walletExists {
+		if len(m.wallets) > 0 {
+			m.SetSelectedWallet(m.wallets[0])
+		} else {
+			m.currentWallet.SetText("No wallet selected")
+			GetGlobalState().SetSelectedWallet("")
+		}
 	}
 }
 
+// Helper method to create the wallet items list
+func (m *WalletManager) createWalletItemsList() fyne.CanvasObject {
+	walletItems := container.NewVBox()
+
+	selectedWallet := GetGlobalState().GetSelectedWallet()
+
+	for _, wallet := range m.wallets {
+		walletButton := widget.NewButton(formatWalletName(wallet), func(wlt string) func() {
+			return func() {
+				m.SetSelectedWallet(wlt)
+			}
+		}(wallet))
+
+		// Highlight the currently selected wallet
+		if wallet == selectedWallet {
+			walletButton.Importance = widget.HighImportance
+		}
+
+		walletItems.Add(walletButton)
+	}
+
+	if len(m.wallets) == 0 {
+		walletItems.Add(widget.NewLabel("No wallets found. Import or generate a wallet."))
+	}
+
+	return walletItems
+}
+
 func (m *WalletManager) importWallet(privateKey string) {
-	// Use the private key to derive the wallet
+	if privateKey == "" {
+		dialog.ShowError(fmt.Errorf("please enter a private key"), m.window)
+		return
+	}
+
 	wallet, err := solana.WalletFromPrivateKeyBase58(privateKey)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("invalid private key: %v", err), m.window)
 		return
 	}
-
 	pubKey := wallet.PublicKey().String()
+
+	// Check if wallet already exists
+	walletMap, _ := m.storage.LoadWallets()
+	if _, exists := walletMap[pubKey]; exists {
+		dialog.ShowInformation("Wallet Exists", "This wallet is already imported. Selecting it now.", m.window)
+		m.SetSelectedWallet(pubKey)
+		return
+	}
 
 	passwordEntry := widget.NewPasswordEntry()
 	passwordEntry.SetPlaceHolder("Enter password to encrypt wallet")
 
 	passwordDialog := dialog.NewCustomConfirm("Encrypt Wallet", "Save", "Cancel", passwordEntry, func(encrypt bool) {
-		if encrypt {
-			password := passwordEntry.Text
-			if password == "" {
-				dialog.ShowError(fmt.Errorf("password cannot be empty"), m.window)
-				return
-			}
-
-			err := m.saveEncryptedWallet(pubKey, privateKey, password)
-			if err != nil {
-				dialog.ShowError(fmt.Errorf("failed to save wallet: %v", err), m.window)
-				return
-			}
-
-			m.wallets = append(m.wallets, pubKey)
-			m.walletList.Refresh()
-			m.walletTabs.Update(m.wallets) // Update tabs after importing a wallet
-			dialog.ShowInformation("Wallet Imported", "Wallet imported and securely stored", m.window)
+		if !encrypt {
+			return
 		}
+
+		password := passwordEntry.Text
+		if password == "" {
+			dialog.ShowError(fmt.Errorf("password cannot be empty"), m.window)
+			return
+		}
+
+		err := m.saveEncryptedWallet(pubKey, privateKey, password)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("failed to save wallet: %v", err), m.window)
+			return
+		}
+
+		// Reload wallets to include the new one
+		m.loadSavedWallets()
+
+		// Select the newly imported wallet
+		m.SetSelectedWallet(pubKey)
+
+		dialog.ShowInformation("Wallet Imported", "Wallet imported and securely stored", m.window)
 	}, m.window)
 
 	passwordDialog.Show()
@@ -167,36 +256,54 @@ func (m *WalletManager) generateWallet() {
 	passwordEntry.SetPlaceHolder("Enter password to encrypt wallet")
 
 	passwordDialog := dialog.NewCustomConfirm("Encrypt Wallet", "Save", "Cancel", passwordEntry, func(encrypt bool) {
-		if encrypt {
-			password := passwordEntry.Text
-			if password == "" {
-				dialog.ShowError(fmt.Errorf("password cannot be empty"), m.window)
-				return
-			}
-
-			err := m.saveEncryptedWallet(pubKey, privateKey, password)
-			if err != nil {
-				dialog.ShowError(fmt.Errorf("failed to save wallet: %v", err), m.window)
-				return
-			}
-
-			m.wallets = append(m.wallets, pubKey)
-			m.walletList.Refresh()
-			m.walletTabs.Update(m.wallets)
-			dialog.ShowInformation("Wallet Generated", fmt.Sprintf("New wallet generated and securely stored. Public Key: %s", pubKey), m.window)
+		if !encrypt {
+			return
 		}
+
+		password := passwordEntry.Text
+		if password == "" {
+			dialog.ShowError(fmt.Errorf("password cannot be empty"), m.window)
+			return
+		}
+
+		err := m.saveEncryptedWallet(pubKey, privateKey, password)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("failed to save wallet: %v", err), m.window)
+			return
+		}
+
+		// Reload wallets to include the new one
+		m.loadSavedWallets()
+
+		// Select the newly generated wallet
+		m.SetSelectedWallet(pubKey)
+
+		dialog.ShowInformation(
+			"Wallet Generated",
+			fmt.Sprintf("New wallet generated and securely stored.\nPublic Key: %s", shortenAddress(pubKey)),
+			m.window,
+		)
 	}, m.window)
 
 	passwordDialog.Show()
 }
 
 func (m *WalletManager) SetSelectedWallet(walletID string) {
-	m.currentWallet.SetText("Selected wallet: " + walletID)
+	// Set the display text
+	m.currentWallet.SetText("Selected wallet: " + shortenAddress(walletID))
+
+	// Update global state
 	GetGlobalState().SetSelectedWallet(walletID)
 
-	// Update the UI to reflect the selected wallet
+	// Update wallet tabs UI if available
 	if m.walletTabs != nil {
 		m.walletTabs.SetSelectedWallet(walletID)
+	}
+
+	// Update the wallet list to highlight the selected wallet
+	if m.walletList != nil {
+		m.walletList.Content = m.createWalletItemsList()
+		m.walletList.Refresh()
 	}
 }
 
@@ -210,32 +317,36 @@ func (m *WalletManager) saveEncryptedWallet(pubKey, privateKey, password string)
 		return err
 	}
 
-	walletsDir := m.GetWalletsDirectory()
-	filename := filepath.Join(walletsDir, pubKey+".wallet")
-
-	if err := ioutil.WriteFile(filename, []byte(encryptedKey), 0600); err != nil {
+	// Save via our storage abstraction.
+	if err := m.storage.SaveWallet(pubKey, encryptedKey); err != nil {
 		return err
-	}
-
-	// Add new wallet to list and update WalletTabs
-	m.wallets = append(m.wallets, pubKey)
-	if m.walletTabs != nil {
-		m.walletTabs.Update(m.wallets)
 	}
 
 	return nil
 }
 
+// Helper function to format wallet name (shortened address)
+func formatWalletName(address string) string {
+	return shortenAddress(address)
+}
+
+// encrypt encrypts data using AES-GCM.
 func encrypt(data []byte, passphrase string) (string, error) {
-	block, _ := aes.NewCipher([]byte(padKey(passphrase)))
+	block, err := aes.NewCipher([]byte(padKey(passphrase)))
+	if err != nil {
+		return "", err
+	}
+
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return "", err
 	}
+
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
 		return "", err
 	}
+
 	ciphertext := gcm.Seal(nonce, nonce, data, nil)
 	return hex.EncodeToString(ciphertext), nil
 }

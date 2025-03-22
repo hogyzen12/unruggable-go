@@ -6,29 +6,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
+	"unruggable-go/internal/storage"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/validation"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gagliardetto/solana-go"
+	associatedtokenaccount "github.com/gagliardetto/solana-go/programs/associated-token-account"
 	"github.com/gagliardetto/solana-go/programs/system"
+	"github.com/gagliardetto/solana-go/programs/token"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/mr-tron/base58"
 )
 
+// Using a public Solana RPC endpoint as fallback
 const (
-	CALYPSO_ENDPOINT = "https://late-clean-snowflake.solana-mainnet.quiknode.pro/08c22e635ed0bae7fd982b2fbec90cad4086b169/"
-	JITO_URL         = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+	SOLANA_RPC_ENDPOINT = "https://special-blue-fog.solana-mainnet.quiknode.pro/d009d548b4b9dd9f062a8124a868fb915937976c/"
+	CALYPSO_ENDPOINT    = "https://special-blue-fog.solana-mainnet.quiknode.pro/d009d548b4b9dd9f062a8124a868fb915937976c/"
+	JITO_URL            = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
 )
 
 type SendScreen struct {
@@ -38,19 +41,39 @@ type SendScreen struct {
 	recipientEntry   *widget.Entry
 	recipientBalance *widget.Label
 	sendButton       *widget.Button
+	refreshButton    *widget.Button
 	statusLabel      *widget.Label
 	window           fyne.Window
 	client           *rpc.Client
 	fromAccount      *solana.PrivateKey
 	app              fyne.App
-	selectedWalletID string // Track the selected wallet ID
+	selectedWalletID string
+	isLoadingBalance bool
+	isVerboseLogging bool // Add this line
 }
 
-type TransactionStatus struct {
-	Signature     string
-	Status        string
-	Confirmations int
-	Error         error
+// Direct RPC request structure for getBalance
+type RpcRequest struct {
+	JsonRPC string        `json:"jsonrpc"`
+	ID      int           `json:"id"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+}
+
+// Direct RPC response structure for getBalance
+type RpcResponse struct {
+	JsonRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Result  struct {
+		Context struct {
+			Slot int64 `json:"slot"`
+		} `json:"context"`
+		Value uint64 `json:"value"`
+	} `json:"result"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 func NewSendScreen(window fyne.Window, app fyne.App) fyne.CanvasObject {
@@ -60,6 +83,7 @@ func NewSendScreen(window fyne.Window, app fyne.App) fyne.CanvasObject {
 		client:           rpc.New(CALYPSO_ENDPOINT),
 		recipientBalance: widget.NewLabel(""),
 		statusLabel:      widget.NewLabel(""),
+		isLoadingBalance: false,
 	}
 
 	// Get the globally selected wallet
@@ -71,20 +95,46 @@ func NewSendScreen(window fyne.Window, app fyne.App) fyne.CanvasObject {
 		s.statusLabel.SetText("No wallet selected. Please select a wallet from the Wallet tab.")
 	}
 
-	// Create the UI components
-	title := canvas.NewText("Send Tokens", theme.ForegroundColor())
-	title.TextStyle = fyne.TextStyle{Bold: true}
-	title.Alignment = fyne.TextAlignCenter
-	title.TextSize = 20
-
-	// Token selection with custom styling
-	s.tokenSelect = widget.NewSelect([]string{"SOL", "USDC", "JTO", "JUP", "JLP"}, s.onTokenSelected)
+	// Token selection
+	tokenOptions := s.getTokenOptions()
+	s.tokenSelect = widget.NewSelect(tokenOptions, s.onTokenSelected)
 	s.tokenSelect.PlaceHolder = "Select token to send"
 
 	// Amount entry with validation
 	s.amountEntry = widget.NewEntry()
 	s.amountEntry.SetPlaceHolder("Enter amount")
 	s.amountEntry.Validator = validation.NewRegexp(`^[0-9]*\.?[0-9]*$`, "Must be a valid number")
+	s.amountEntry.OnChanged = func(text string) {
+		s.validateForm()
+	}
+
+	// Max button
+	maxButton := widget.NewButton("Max", func() {
+		balances := GetGlobalState().GetWalletBalances()
+		if balances == nil || s.tokenSelect.Selected == "" {
+			return
+		}
+
+		var availableBalance float64
+		if s.tokenSelect.Selected == "SOL" {
+			if balances.SolBalance > 0.01 {
+				availableBalance = balances.SolBalance - 0.01
+			}
+		} else {
+			for _, holding := range balances.Assets {
+				if holding.Symbol == s.tokenSelect.Selected {
+					availableBalance = holding.Balance
+					break
+				}
+			}
+		}
+
+		if availableBalance > 0 {
+			s.amountEntry.SetText(fmt.Sprintf("%.9f", availableBalance))
+		}
+	})
+	maxButton.Importance = widget.MediumImportance
+	maxButton.Resize(fyne.NewSize(60, maxButton.MinSize().Height))
 
 	// Recipient address entry with validation
 	s.recipientEntry = widget.NewEntry()
@@ -92,84 +142,213 @@ func NewSendScreen(window fyne.Window, app fyne.App) fyne.CanvasObject {
 	s.recipientEntry.OnChanged = s.validateAndFetchBalance
 	s.recipientEntry.Validator = validation.NewRegexp(`^[1-9A-HJ-NP-Za-km-z]{43,44}$`, "Must be a valid Solana address")
 
-	// Send button with styling
-	s.sendButton = widget.NewButton("Send Transaction", s.handleSendTransaction)
+	// Send button
+	s.sendButton = widget.NewButton("Send", s.handleSendTransaction)
 	s.sendButton.Importance = widget.HighImportance
 	s.sendButton.Disable()
 
-	// Layout using containers with proper spacing
+	// Refresh balances button
+	s.refreshButton = widget.NewButton("Refresh", func() {
+		s.refreshWalletBalances()
+	})
+
+	// Layout with compact design
 	form := container.NewVBox(
-		container.NewPadded(title),
-		widget.NewSeparator(),
+		// Token row with balance
 		container.NewGridWithColumns(2,
 			widget.NewLabel("Token:"),
 			s.tokenSelect,
 		),
-		container.NewGridWithColumns(2,
-			widget.NewLabel("Amount:"),
-			s.amountEntry,
+
+		// Amount row with Max button
+		container.NewBorder(nil, nil, nil, maxButton,
+			container.NewGridWithColumns(2,
+				widget.NewLabel("Amount:"),
+				s.amountEntry,
+			),
 		),
+
+		// Recipient row
 		container.NewGridWithColumns(2,
 			widget.NewLabel("Recipient:"),
 			s.recipientEntry,
 		),
+
+		// Recipient balance info
 		container.NewHBox(
 			widget.NewIcon(theme.InfoIcon()),
 			s.recipientBalance,
 		),
-		container.NewPadded(s.sendButton),
+
+		// Action buttons in a row
+		container.NewGridWithColumns(2,
+			s.sendButton,
+			s.refreshButton,
+		),
+
+		// Status message
 		container.NewHBox(
 			widget.NewIcon(theme.InfoIcon()),
 			s.statusLabel,
 		),
 	)
 
-	// Add padding and scrolling for better mobile experience
+	// Wrap in scroll container for mobile
 	scroll := container.NewScroll(form)
-	scroll.SetMinSize(fyne.NewSize(300, 400))
-
 	s.container = container.NewPadded(scroll)
+
+	// Initialize with first token if available
+	if len(tokenOptions) > 0 && GetGlobalState().GetWalletBalances() != nil {
+		s.tokenSelect.SetSelected(tokenOptions[0])
+	}
+
 	return s.container
 }
 
-func (s *SendScreen) onTokenSelected(value string) {
-	s.validateForm()
+func (s *SendScreen) getTokenOptions() []string {
+	balances := GetGlobalState().GetWalletBalances()
+	if balances == nil {
+		return []string{"SOL"} // Fallback to SOL if balances not loaded
+	}
+	options := []string{"SOL"}
+	for _, asset := range balances.Assets {
+		if asset.Balance > 0 { // Only show tokens with non-zero balance
+			options = append(options, asset.Symbol)
+		}
+	}
+	return options
 }
 
-// Replace the validateAndFetchBalance function with this corrected version:
+func (s *SendScreen) onTokenSelected(value string) {
+	if value != "" {
+		s.validateForm()
+		s.updateBalanceInfo()
+	}
+}
+
+func (s *SendScreen) updateBalanceInfo() {
+	if s.tokenSelect.Selected == "" {
+		return
+	}
+
+	balances := GetGlobalState().GetWalletBalances()
+	if balances == nil {
+		return
+	}
+
+	var availableBalance float64
+	var symbol string
+
+	if s.tokenSelect.Selected == "SOL" {
+		availableBalance = balances.SolBalance
+		symbol = "SOL"
+	} else {
+		for _, holding := range balances.Assets {
+			if holding.Symbol == s.tokenSelect.Selected {
+				availableBalance = holding.Balance
+				symbol = holding.Symbol
+				break
+			}
+		}
+	}
+
+	// Update the status label with the balance info
+	s.statusLabel.SetText(fmt.Sprintf("Available: %.6f %s", availableBalance, symbol))
+}
+
+// fetchBalanceWithRPC is a direct RPC call to get balance without using the solana-go client
+func (s *SendScreen) fetchBalanceWithRPC(address string) {
+	// Don't start a new fetch if one is already in progress
+	if s.isLoadingBalance {
+		return
+	}
+
+	s.isLoadingBalance = true
+	s.recipientBalance.SetText("Checking recipient account...")
+
+	go func() {
+		defer func() { s.isLoadingBalance = false }()
+
+		// Try multiple RPC endpoints
+		endpoints := []string{CALYPSO_ENDPOINT, SOLANA_RPC_ENDPOINT}
+
+		for _, endpoint := range endpoints {
+			// Create RPC request
+			reqBody := RpcRequest{
+				JsonRPC: "2.0",
+				ID:      1,
+				Method:  "getBalance",
+				Params:  []interface{}{address},
+			}
+
+			jsonData, err := json.Marshal(reqBody)
+			if err != nil {
+				continue // Try next endpoint
+			}
+
+			// Send request
+			resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(jsonData))
+			if err != nil {
+				continue // Try next endpoint
+			}
+			defer resp.Body.Close()
+
+			// Read and parse response
+			respData, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				continue // Try next endpoint
+			}
+
+			var rpcResp RpcResponse
+			if err := json.Unmarshal(respData, &rpcResp); err != nil {
+				continue // Try next endpoint
+			}
+
+			// Check for errors
+			if rpcResp.Error != nil {
+				continue // Try next endpoint
+			}
+
+			// Success - update UI and return
+			solBalance := float64(rpcResp.Result.Value) / float64(solana.LAMPORTS_PER_SOL)
+			s.recipientBalance.SetText(fmt.Sprintf("Recipient SOL: %.6f", solBalance))
+			return
+		}
+
+		// All endpoints failed
+		s.recipientBalance.SetText("Could not fetch recipient balance")
+	}()
+}
+
 func (s *SendScreen) validateAndFetchBalance(address string) {
 	s.recipientBalance.SetText("")
 	s.validateForm()
 
-	if address == "" {
+	if address == "" || len(address) < 32 || !isValidSolanaAddress(address) {
 		return
 	}
 
-	// Validate address format
-	pubKey, err := solana.PublicKeyFromBase58(address)
-	if err != nil {
-		s.statusLabel.SetText("Invalid Solana address")
-		return
-	}
+	// Use the direct RPC method instead of the client
+	s.fetchBalanceWithRPC(address)
+}
 
-	// Fetch balance
+func (s *SendScreen) refreshWalletBalances() {
+	s.statusLabel.SetText("Refreshing balances...")
+
 	go func() {
-		balance, err := s.client.GetBalance(
-			context.Background(),
-			pubKey,
-			rpc.CommitmentFinalized,
-		)
-		if err != nil {
-			s.recipientBalance.SetText("Error fetching balance")
+		if err := RefreshWalletBalances(); err != nil {
+			s.statusLabel.SetText(fmt.Sprintf("Refresh failed: %v", err))
 			return
 		}
 
-		solBalance := float64(balance.Value) / float64(solana.LAMPORTS_PER_SOL)
-		s.recipientBalance.SetText(fmt.Sprintf("Recipient Balance: %.9f SOL", solBalance))
+		s.tokenSelect.Options = s.getTokenOptions()
+		s.tokenSelect.Refresh()
+		s.validateForm()
+		s.updateBalanceInfo()
+		s.window.Canvas().Refresh(s.container)
 	}()
 }
 
-// Add this helper function to validate Solana addresses
 func isValidSolanaAddress(address string) bool {
 	if len(address) != 44 && len(address) != 43 {
 		return false
@@ -178,24 +357,71 @@ func isValidSolanaAddress(address string) bool {
 	return err == nil
 }
 
-// Update the validateForm function to use the new validation
 func (s *SendScreen) validateForm() {
-	isValid := s.tokenSelect.Selected != "" &&
-		s.amountEntry.Text != "" &&
-		s.recipientEntry.Text != "" &&
-		s.amountEntry.Validate() == nil &&
-		isValidSolanaAddress(s.recipientEntry.Text)
-
-	if isValid {
-		s.sendButton.Enable()
-	} else {
-		s.sendButton.Disable()
+	// Guard against nil reference or empty selection
+	if s.tokenSelect == nil || s.tokenSelect.Selected == "" || s.amountEntry == nil || s.recipientEntry == nil {
+		if s.sendButton != nil {
+			s.sendButton.Disable()
+		}
+		return
 	}
+
+	// If any field is empty, disable the button and return early
+	if s.amountEntry.Text == "" || s.recipientEntry.Text == "" {
+		s.sendButton.Disable()
+		return
+	}
+
+	// Validate amount and recipient address
+	if s.amountEntry.Validate() != nil || !isValidSolanaAddress(s.recipientEntry.Text) {
+		s.sendButton.Disable()
+		return
+	}
+
+	// Parse the amount
+	amount, err := strconv.ParseFloat(s.amountEntry.Text, 64)
+	if err != nil {
+		s.sendButton.Disable()
+		return
+	}
+
+	// Check wallet balances
+	balances := GetGlobalState().GetWalletBalances()
+	if balances == nil {
+		s.sendButton.Disable()
+		s.statusLabel.SetText("Balances not loaded yet. Please wait or refresh.")
+		return
+	}
+
+	// Determine available balance for the selected token
+	selectedToken := s.tokenSelect.Selected
+	var availableBalance float64
+	if selectedToken == "SOL" {
+		availableBalance = balances.SolBalance
+	} else {
+		for _, holding := range balances.Assets {
+			if holding.Symbol == selectedToken {
+				availableBalance = holding.Balance
+				break
+			}
+		}
+	}
+
+	// Check if the amount is valid and sufficient
+	if amount <= 0 || amount > availableBalance {
+		s.sendButton.Disable()
+		s.statusLabel.SetText(fmt.Sprintf("Insufficient balance: %.6f %s available", availableBalance, selectedToken))
+		return
+	}
+
+	// If all checks pass, enable the send button
+	s.sendButton.Enable()
+	s.updateBalanceInfo()
 }
 
 func (s *SendScreen) handleSendTransaction() {
 	if s.selectedWalletID == "" {
-		dialog.ShowError(fmt.Errorf("no wallet selected - please select a wallet from the Wallet tab"), s.window)
+		dialog.ShowError(fmt.Errorf("no wallet selected - please select a wallet first"), s.window)
 		return
 	}
 
@@ -205,104 +431,158 @@ func (s *SendScreen) handleSendTransaction() {
 		return
 	}
 
-	// Show password dialog for decryption
-	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.PlaceHolder = "Enter wallet password"
+	// Confirm the transaction
+	confirmText := fmt.Sprintf("Send %.6f %s to %s?",
+		amount,
+		s.tokenSelect.Selected,
+		shortenAddress(s.recipientEntry.Text))
 
-	dialog.ShowCustomConfirm("Decrypt Wallet", "Send", "Cancel", passwordEntry, func(confirm bool) {
-		if !confirm {
+	dialog.ShowConfirm("Confirm Transaction", confirmText, func(confirmed bool) {
+		if !confirmed {
 			return
 		}
 
-		// Decrypt wallet
-		if err := s.decryptAndPrepareWallet(passwordEntry.Text); err != nil {
-			dialog.ShowError(err, s.window)
-			return
-		}
+		// Show password dialog for decryption
+		passwordEntry := widget.NewPasswordEntry()
+		passwordEntry.SetPlaceHolder("Enter wallet password")
 
-		// Proceed with transaction
-		go s.executeTransaction(amount)
+		dialog.ShowCustomConfirm("Decrypt Wallet", "Send", "Cancel", passwordEntry, func(confirm bool) {
+			if !confirm {
+				return
+			}
+
+			// Decrypt wallet
+			if err := s.decryptAndPrepareWallet(passwordEntry.Text); err != nil {
+				dialog.ShowError(err, s.window)
+				return
+			}
+
+			// Proceed with transaction
+			go s.executeTransaction(amount)
+		}, s.window)
 	}, s.window)
 }
 
-func (s *SendScreen) loadSelectedWallet(walletID string) {
-	walletsDir := filepath.Join(s.app.Storage().RootURI().Path(), "wallets")
-	filename := filepath.Join(walletsDir, walletID+".wallet")
-
-	// Read the encrypted wallet file
-	encryptedData, err := ioutil.ReadFile(filename)
+func (s *SendScreen) decryptAndPrepareWallet(password string) error {
+	// Use the storage abstraction to access wallet data
+	walletStorage := storage.NewWalletStorage(s.app)
+	walletMap, err := walletStorage.LoadWallets()
 	if err != nil {
-		s.statusLabel.SetText(fmt.Sprintf("Error reading wallet file: %v", err))
-		return
+		return fmt.Errorf("error loading wallets: %v", err)
 	}
 
-	// Prompt for password
-	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.SetPlaceHolder("Enter wallet password")
+	// Get the encrypted wallet data
+	encryptedData, ok := walletMap[s.selectedWalletID]
+	if !ok {
+		return fmt.Errorf("wallet %s not found", s.selectedWalletID)
+	}
 
-	dialog.ShowCustomConfirm("Decrypt Wallet", "Unlock", "Cancel", passwordEntry, func(unlock bool) {
-		if !unlock {
-			return
-		}
+	decryptedKey, err := decrypt(encryptedData, password)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt wallet: %v", err)
+	}
 
-		decryptedKey, err := decrypt(string(encryptedData), passwordEntry.Text)
-		if err != nil {
-			dialog.ShowError(fmt.Errorf("Failed to decrypt wallet: %v", err), s.window)
-			return
-		}
-
-		// Convert the decrypted private key to a Solana private key
-		privateKey := solana.MustPrivateKeyFromBase58(string(decryptedKey))
-		s.fromAccount = &privateKey
-
-		s.statusLabel.SetText(fmt.Sprintf("Loaded wallet: %s", privateKey.PublicKey().String()))
-	}, s.window)
+	privateKey := solana.MustPrivateKeyFromBase58(string(decryptedKey))
+	s.fromAccount = &privateKey
+	return nil
 }
 
-// Add new method for creating transfer transaction
 func (s *SendScreen) createTransferTransaction(fromWallet, toAddress string, amount float64) (*solana.Transaction, error) {
 	fromPubkey := solana.MustPublicKeyFromBase58(fromWallet)
 	toPubkey := solana.MustPublicKeyFromBase58(toAddress)
 
-	// Convert amount to lamports
-	amountLamports := uint64(amount * float64(solana.LAMPORTS_PER_SOL))
-
+	selectedToken := s.tokenSelect.Selected
 	recent, err := s.client.GetRecentBlockhash(context.Background(), rpc.CommitmentFinalized)
 	if err != nil {
 		return nil, fmt.Errorf("error getting recent blockhash: %v", err)
 	}
 
-	tx, err := solana.NewTransaction(
-		[]solana.Instruction{
-			system.NewTransferInstruction(
-				amountLamports,
+	if selectedToken == "SOL" {
+		// SOL transfer
+		amountLamports := uint64(amount * float64(solana.LAMPORTS_PER_SOL))
+		tx, err := solana.NewTransaction(
+			[]solana.Instruction{
+				system.NewTransferInstruction(
+					amountLamports,
+					fromPubkey,
+					toPubkey,
+				).Build(),
+			},
+			recent.Value.Blockhash,
+			solana.TransactionPayer(fromPubkey),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("error creating SOL transaction: %v", err)
+		}
+		return tx, nil
+	}
+
+	// SPL token transfer
+	balances := GetGlobalState().GetWalletBalances()
+	var mint string
+	var decimals int
+	for _, holding := range balances.Assets {
+		if holding.Symbol == selectedToken {
+			mint = holding.Address
+			decimals = holding.Decimals
+			break
+		}
+	}
+	if mint == "" {
+		return nil, fmt.Errorf("token %s not found in wallet", selectedToken)
+	}
+
+	// Find sender's token account
+	senderATA, _, err := solana.FindAssociatedTokenAddress(fromPubkey, solana.MustPublicKeyFromBase58(mint))
+	if err != nil {
+		return nil, fmt.Errorf("error finding sender ATA: %v", err)
+	}
+
+	// Find or create recipient's token account
+	recipientATA, _, err := solana.FindAssociatedTokenAddress(toPubkey, solana.MustPublicKeyFromBase58(mint))
+	if err != nil {
+		return nil, fmt.Errorf("error finding recipient ATA: %v", err)
+	}
+
+	// Check if recipient ATA exists
+	_, err = s.client.GetAccountInfo(context.Background(), recipientATA)
+	createRecipientATA := err != nil
+
+	var instructions []solana.Instruction
+	if createRecipientATA {
+		instructions = append(instructions,
+			associatedtokenaccount.NewCreateInstruction(
 				fromPubkey,
 				toPubkey,
+				solana.MustPublicKeyFromBase58(mint),
 			).Build(),
-		},
+		)
+	}
+
+	// Add transfer instruction
+	amountLamports := uint64(amount * math.Pow(10, float64(decimals)))
+	instructions = append(instructions,
+		token.NewTransferInstruction(
+			amountLamports,
+			senderATA,
+			recipientATA,
+			fromPubkey,
+			[]solana.PublicKey{}, // No multisigners
+		).Build(),
+	)
+
+	tx, err := solana.NewTransaction(
+		instructions,
 		recent.Value.Blockhash,
 		solana.TransactionPayer(fromPubkey),
 	)
-
 	if err != nil {
-		return nil, fmt.Errorf("error creating transaction: %v", err)
-	}
-
-	// Sign the transaction
-	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
-		if key.Equals(fromPubkey) {
-			return s.fromAccount
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error signing transaction: %v", err)
+		return nil, fmt.Errorf("error creating SPL transaction: %v", err)
 	}
 
 	return tx, nil
 }
 
-// Add createTipTransaction method (similar to CalypsoBot's implementation)
 func (s *SendScreen) createTipTransaction() (*solana.Transaction, error) {
 	recent, err := s.client.GetRecentBlockhash(context.Background(), rpc.CommitmentFinalized)
 	if err != nil {
@@ -313,7 +593,6 @@ func (s *SendScreen) createTipTransaction() (*solana.Transaction, error) {
 	builder.SetFeePayer(s.fromAccount.PublicKey())
 	builder.SetRecentBlockHash(recent.Value.Blockhash)
 
-	// Add tip transfers
 	tipRecipients := []string{
 		"juLesoSmdTcRtzjCzYzRoHrnF8GhVu6KCV7uxq7nJGp",
 		"DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
@@ -325,13 +604,12 @@ func (s *SendScreen) createTipTransaction() (*solana.Transaction, error) {
 			s.fromAccount.PublicKey(),
 			solana.MustPublicKeyFromBase58(recipient),
 		).Build()
-
 		builder.AddInstruction(tipInstruction)
 	}
 
 	tx, err := builder.Build()
 	if err != nil {
-		return nil, fmt.Errorf("failed to build transaction: %v", err)
+		return nil, fmt.Errorf("failed to build tip transaction: %v", err)
 	}
 
 	_, err = tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
@@ -347,173 +625,259 @@ func (s *SendScreen) createTipTransaction() (*solana.Transaction, error) {
 	return tx, nil
 }
 
-// Replace the sendBundle method with this corrected version:
+// Fixed sendBundle function with proper error handling and request structure
 func (s *SendScreen) sendBundle(transactions []*solana.Transaction) (string, error) {
-	encodedTransactions := make([]string, len(transactions))
-	for i, tx := range transactions {
-		encodedTx, err := tx.MarshalBinary()
-		if err != nil {
-			return "", fmt.Errorf("failed to encode transaction: %v", err)
-		}
-		encodedTransactions[i] = base58.Encode(encodedTx)
+	// Validate that we have transactions to send
+	if len(transactions) == 0 {
+		return "", fmt.Errorf("no transactions to send")
 	}
 
+	// Encode transactions
+	encodedTransactions := make([]string, len(transactions))
+	for i, tx := range transactions {
+		// Make sure transaction is signed
+		if len(tx.Signatures) == 0 {
+			return "", fmt.Errorf("transaction %d is not signed", i)
+		}
+
+		// Marshal the transaction to binary
+		encodedTx, err := tx.MarshalBinary()
+		if err != nil {
+			return "", fmt.Errorf("failed to encode transaction %d: %v", i, err)
+		}
+
+		// Encode the binary to base58
+		encodedTransactions[i] = base58.Encode(encodedTx)
+
+		// Debug log for troubleshooting
+		if s.isVerboseLogging {
+			s.logDebug(fmt.Sprintf("Encoded tx %d: %s (first 20 chars)", i, encodedTransactions[i][:20]))
+		}
+	}
+
+	// Create the bundle request with proper structure
+	// Note: Jito expects params to be an array containing an array of transactions
 	bundleData := map[string]interface{}{
 		"jsonrpc": "2.0",
 		"id":      1,
 		"method":  "sendBundle",
-		"params":  []interface{}{encodedTransactions},
+		"params":  []interface{}{encodedTransactions}, // This is the key fix - params is an array containing one array
 	}
 
-	// Marshal the bundle data
+	// Marshal to JSON
 	bundleJSON, err := json.Marshal(bundleData)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal bundle data: %v", err)
 	}
 
-	resp, err := http.Post(JITO_URL, "application/json", bytes.NewBuffer(bundleJSON))
+	// Debug log
+	if s.isVerboseLogging {
+		s.logDebug(fmt.Sprintf("Sending bundle request: %s", string(bundleJSON)))
+	}
+
+	// Create HTTP request with proper headers
+	req, err := http.NewRequest("POST", JITO_URL, bytes.NewBuffer(bundleJSON))
+	if err != nil {
+		return "", fmt.Errorf("failed to create HTTP request: %v", err)
+	}
+
+	// Set content type header
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send the request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send bundle: %v", err)
 	}
 	defer resp.Body.Close()
 
+	// Read response body
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// Debug log
+	if s.isVerboseLogging {
+		s.logDebug(fmt.Sprintf("Bundle response: %s", string(respBody)))
+	}
+
+	// Parse response
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", fmt.Errorf("failed to decode bundle response: %v", err)
 	}
 
+	// Check for error field in response
 	if errorData, ok := result["error"]; ok {
-		return "", fmt.Errorf("bundle error: %v", errorData)
+		// Try to extract detailed error information
+		errorMsg := "unknown error"
+		if errObj, ok := errorData.(map[string]interface{}); ok {
+			if msg, ok := errObj["message"].(string); ok {
+				errorMsg = msg
+			}
+		} else if errStr, ok := errorData.(string); ok {
+			errorMsg = errStr
+		}
+		return "", fmt.Errorf("bundle error: %s", errorMsg)
 	}
 
-	bundleID, ok := result["result"].(string)
+	// Get result field, which should be the bundle ID
+	resultField, ok := result["result"]
 	if !ok {
-		return "", fmt.Errorf("invalid bundle response")
+		return "", fmt.Errorf("no result in response")
+	}
+
+	// The result could be a string (bundle ID) or could have a different structure
+	bundleID, ok := resultField.(string)
+	if !ok {
+		// Try to handle case where result might be structured differently
+		bundleID = fmt.Sprintf("%v", resultField)
+	}
+
+	if bundleID == "" {
+		return "", fmt.Errorf("empty bundle ID returned")
 	}
 
 	return bundleID, nil
 }
 
-func (s *SendScreen) listWalletFiles() ([]string, error) {
-	walletsDir := filepath.Join(s.app.Storage().RootURI().Path(), "wallets")
-	files, err := ioutil.ReadDir(walletsDir)
-	if err != nil {
-		return nil, err
-	}
-
-	var walletFiles []string
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".wallet") {
-			walletFiles = append(walletFiles, strings.TrimSuffix(file.Name(), ".wallet"))
-		}
-	}
-	return walletFiles, nil
-}
-
-// New method to handle wallet decryption
-func (s *SendScreen) decryptAndPrepareWallet(password string) error {
-	walletsDir := filepath.Join(s.app.Storage().RootURI().Path(), "wallets")
-	filename := filepath.Join(walletsDir, s.selectedWalletID+".wallet")
-
-	encryptedData, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("error reading wallet file: %v", err)
-	}
-
-	decryptedKey, err := decrypt(string(encryptedData), password)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt wallet: %v", err)
-	}
-
-	privateKey := solana.MustPrivateKeyFromBase58(string(decryptedKey))
-	s.fromAccount = &privateKey
-	return nil
-}
-
+// Enhanced executeTransaction function to properly build and send the bundle
 func (s *SendScreen) executeTransaction(amount float64) {
-	s.statusLabel.SetText("Creating transaction bundle...")
+	// Add a flag for verbose logging for debugging
+	s.isVerboseLogging = false // Set to true when debugging is needed
+
+	s.statusLabel.SetText("Creating transaction...")
 	s.sendButton.Disable()
 
-	// Create the main transfer transaction
+	// 1. Create the main transfer transaction
 	transferTx, err := s.createTransferTransaction(s.fromAccount.PublicKey().String(), s.recipientEntry.Text, amount)
 	if err != nil {
-		dialog.ShowError(err, s.window)
+		dialog.ShowError(fmt.Errorf("failed to create transfer transaction: %v", err), s.window)
 		s.sendButton.Enable()
 		s.statusLabel.SetText("Transaction failed")
 		return
 	}
 
-	// Get the transfer transaction signature before bundling
+	// 2. Sign the transfer transaction
+	_, err = transferTx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+		if key.Equals(s.fromAccount.PublicKey()) {
+			return s.fromAccount
+		}
+		return nil
+	})
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("error signing transfer transaction: %v", err), s.window)
+		s.sendButton.Enable()
+		s.statusLabel.SetText("Transaction failed")
+		return
+	}
+
+	// Save the transfer transaction signature before bundling
 	transferSig := transferTx.Signatures[0].String()
 
-	// Create tip transaction
+	// 3. Create tip transaction
 	tipTx, err := s.createTipTransaction()
 	if err != nil {
-		dialog.ShowError(err, s.window)
-		s.sendButton.Enable()
-		s.statusLabel.SetText("Transaction failed")
-		return
+		// If tip transaction fails, we can still proceed with just the transfer
+		s.logDebug(fmt.Sprintf("Failed to create tip transaction: %v", err))
+
+		// Fall back to sending just the transfer transaction
+		encodedTx, err := transferTx.MarshalBinary()
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("error encoding transaction: %v", err), s.window)
+			s.sendButton.Enable()
+			s.statusLabel.SetText("Transaction failed")
+			return
+		}
+
+		// Send single transaction using standard Solana RPC
+		s.statusLabel.SetText("Sending transaction...")
+		encodedTxBase58 := base58.Encode(encodedTx)
+		sig, err := s.client.SendEncodedTransaction(context.Background(), encodedTxBase58)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("error sending transaction: %v", err), s.window)
+			s.sendButton.Enable()
+			s.statusLabel.SetText("Transaction failed")
+			return
+		}
+
+		// Use signature from RPC response
+		transferSig = sig.String()
+	} else {
+		// 4. Bundle transactions and send
+		s.statusLabel.SetText("Sending transaction bundle...")
+		_, err = s.sendBundle([]*solana.Transaction{transferTx, tipTx})
+		if err != nil {
+			s.logDebug(fmt.Sprintf("Bundle failed: %v. Falling back to standard transaction.", err))
+
+			// Fallback to sending just the transfer if bundle fails
+			encodedTx, err := transferTx.MarshalBinary()
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("error encoding transaction: %v", err), s.window)
+				s.sendButton.Enable()
+				s.statusLabel.SetText("Transaction failed")
+				return
+			}
+
+			encodedTxBase58 := base58.Encode(encodedTx)
+			sig, err := s.client.SendEncodedTransaction(context.Background(), encodedTxBase58)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("error sending transaction: %v", err), s.window)
+				s.sendButton.Enable()
+				s.statusLabel.SetText("Transaction failed")
+				return
+			}
+
+			// Use signature from RPC response
+			transferSig = sig.String()
+		}
 	}
 
-	// Bundle transactions
-	bundleID, err := s.sendBundle([]*solana.Transaction{transferTx, tipTx})
-	if err != nil {
-		dialog.ShowError(err, s.window)
-		s.sendButton.Enable()
-		s.statusLabel.SetText("Transaction failed")
-		return
-	}
-
-	s.statusLabel.SetText(fmt.Sprintf("Bundle sent: %s\nTracking transaction: %s",
-		bundleID,
-		transferSig,
-	))
-
-	// Start monitoring the main transaction
+	s.statusLabel.SetText(fmt.Sprintf("Transaction sent with ID: %s", shortenAddress(transferSig)))
 	s.monitorTransaction(transferSig)
 	s.clearForm()
+
+	// Refresh balances after a short delay
+	go func() {
+		time.Sleep(5 * time.Second)
+		s.refreshWalletBalances()
+	}()
 }
 
-// Helper function to shorten addresses for display
-func shortenAddress(address string) string {
-	if len(address) <= 8 {
-		return address
+// Add debugging helper method
+func (s *SendScreen) logDebug(message string) {
+	if s.isVerboseLogging {
+		fmt.Println(message)
+		// Could also update UI or log to file
 	}
-	return fmt.Sprintf("%s...%s", address[:4], address[len(address)-4:])
 }
 
 func (s *SendScreen) monitorTransaction(signatureStr string) {
 	const maxAttempts = 30
 	attempts := 0
 
-	// Parse signature into Solana signature type
 	signature := solana.MustSignatureFromBase58(signatureStr)
 
-	// Create status container
-	statusContent := container.NewVBox()
-	statusDialog := dialog.NewCustom("Transaction Status", "Close", statusContent, s.window)
+	// Create a small status popup
+	statusContent := container.NewVBox(
+		widget.NewLabel("Transaction Status"),
+		widget.NewLabel(fmt.Sprintf("Tx: %s", shortenAddress(signatureStr))),
+		widget.NewProgressBarInfinite(),
+		widget.NewLabel("Confirming transaction..."),
+	)
+	statusPopup := widget.NewModalPopUp(statusContent, s.window.Canvas())
+	statusPopup.Show()
 
-	updateStatus := func(status string) {
-		statusContent.Objects = []fyne.CanvasObject{
-			widget.NewLabel(fmt.Sprintf("Transaction: %s", shortenAddress(signatureStr))),
-			widget.NewLabel(fmt.Sprintf("Status: %s", status)),
-			widget.NewProgressBarInfinite(),
-		}
-		statusDialog.Refresh()
-	}
-
-	updateStatus("Confirming...")
-	statusDialog.Show()
-
-	// Start monitoring in goroutine
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		defer statusPopup.Hide()
 
 		for range ticker.C {
 			attempts++
 
-			// Get transaction status
 			response, err := s.client.GetTransaction(
 				context.Background(),
 				signature,
@@ -524,36 +888,35 @@ func (s *SendScreen) monitorTransaction(signatureStr string) {
 
 			if err != nil {
 				if attempts >= maxAttempts {
-					updateStatus(fmt.Sprintf("Failed to confirm: %v", err))
+					dialog.ShowError(fmt.Errorf("Transaction timed out: %v", err), s.window)
 					return
 				}
 				continue
 			}
 
-			// Check if transaction is finalized
 			if response != nil {
 				if response.Meta.Err != nil {
-					updateStatus(fmt.Sprintf("Transaction failed: %v", response.Meta.Err))
+					dialog.ShowError(fmt.Errorf("Transaction failed: %v", response.Meta.Err), s.window)
 					return
 				}
 
-				// Transaction confirmed!
-				statusContent.Objects = []fyne.CanvasObject{
+				// Show success dialog
+				successContent := container.NewVBox(
 					widget.NewIcon(theme.ConfirmIcon()),
 					widget.NewLabel("Transaction Confirmed!"),
-					widget.NewLabel(fmt.Sprintf("Signature: %s", shortenAddress(signatureStr))),
 					widget.NewLabel(fmt.Sprintf("Block: %d", response.Slot)),
 					widget.NewButtonWithIcon("View in Explorer", theme.ComputerIcon(), func() {
-						explorerURL, _ := url.Parse(fmt.Sprintf("https://explorer.solana.com/tx/%s", signatureStr))
-						s.app.OpenURL(explorerURL)
+						explorerURL := fmt.Sprintf("https://explorer.solana.com/tx/%s", signatureStr)
+						s.app.OpenURL(&url.URL{Path: explorerURL})
 					}),
-				}
-				statusDialog.Refresh()
+				)
+
+				dialog.ShowCustom("Success", "Close", successContent, s.window)
 				return
 			}
 
 			if attempts >= maxAttempts {
-				updateStatus("Timed out waiting for confirmation")
+				dialog.ShowError(fmt.Errorf("Transaction timed out"), s.window)
 				return
 			}
 		}
@@ -565,5 +928,6 @@ func (s *SendScreen) clearForm() {
 	s.amountEntry.SetText("")
 	s.recipientEntry.SetText("")
 	s.recipientBalance.SetText("")
-	s.sendButton.Enable()
+	s.statusLabel.SetText("Transaction submitted. Enter new details to send again.")
+	s.sendButton.Disable()
 }

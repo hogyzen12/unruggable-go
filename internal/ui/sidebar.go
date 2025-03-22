@@ -8,17 +8,14 @@ import (
 
 type Sidebar struct {
 	widget.BaseWidget
-	OnHomeClicked        func()
-	OnSendClicked        func()
-	OnWalletClicked      func()
-	OnAddressBookClicked func()
-	OnTxHistoryClicked   func()
-	//OnSwapClicked        func()
-	//OnBulkActionsClicked func()
-	//OnCalypsoClicked     func()
-	//OnUnruggableClicked  func()
-	//OnKeygenClicked      func()
-	//OnSigningClicked     func()
+	OnHomeClicked           func()
+	OnSendClicked           func()
+	OnWalletClicked         func()
+	OnAddressBookClicked    func()
+	OnTxHistoryClicked      func()
+	OnCalypsoClicked        func()
+	OnConditionalBotClicked func() // New field for Conditional Bot
+	OnHardwareSignClicked   func() // New field for Conditional Bot
 }
 
 func NewSidebar() *Sidebar {
@@ -43,48 +40,29 @@ func (s *Sidebar) CreateRenderer() fyne.WidgetRenderer {
 			s.OnWalletClicked()
 		}
 	})
-	addressBookBtn := widget.NewButton("Address Book", func() {
-		if s.OnAddressBookClicked != nil {
-			s.OnAddressBookClicked()
+	calypsoBtn := widget.NewButton("Calypso", func() {
+		if s.OnCalypsoClicked != nil {
+			s.OnCalypsoClicked()
 		}
 	})
-	txHistoryBtn := widget.NewButton("TX History", func() {
-		if s.OnTxHistoryClicked != nil {
-			s.OnTxHistoryClicked()
+	conditionalBotBtn := widget.NewButton("Conditional Bot", func() {
+		if s.OnConditionalBotClicked != nil {
+			s.OnConditionalBotClicked()
 		}
 	})
-	//swapBtn := widget.NewButton("Swap", func() {
-	//	if s.OnSwapClicked != nil {
-	//		s.OnSwapClicked()
-	//	}
-	//})
-	//bulkActionsBtn := widget.NewButton("Bulk Actions", func() {
-	//	if s.OnBulkActionsClicked != nil {
-	//		s.OnBulkActionsClicked()
-	//	}
-	//})
-	//calypsoBtn := widget.NewButton("Calypso", func() {
-	//	if s.OnCalypsoClicked != nil {
-	//		s.OnCalypsoClicked()
-	//	}
-	//})
-	//unruggableBtn := widget.NewButton("Unruggable", func() {
-	//	if s.OnUnruggableClicked != nil {
-	//		s.OnUnruggableClicked()
-	//	}
-	//})
-	//keygenBtn := widget.NewButton("Keygen", func() {
-	//	if s.OnKeygenClicked != nil {
-	//		s.OnKeygenClicked()
-	//	}
-	//})
-	//signingBtn := widget.NewButton("Signing", func() {
-	//	if s.OnSigningClicked != nil {
-	//		s.OnSigningClicked()
-	//	}
-	//})
+	hardwareSignBtn := widget.NewButton("Hardware Sign", func() {
+		if s.OnHardwareSignClicked != nil {
+			s.OnHardwareSignClicked()
+		}
+	})
 
-	//content := container.NewVBox(homeBtn, sendBtn, walletBtn, addressBookBtn, txHistoryBtn, swapBtn, bulkActionsBtn, calypsoBtn, unruggableBtn, keygenBtn, signingBtn)
-	content := container.NewVBox(homeBtn, sendBtn, walletBtn, addressBookBtn, txHistoryBtn)
+	content := container.NewVBox(
+		homeBtn,
+		sendBtn,
+		walletBtn,
+		calypsoBtn,
+		conditionalBotBtn,
+		hardwareSignBtn)
+
 	return widget.NewSimpleRenderer(content)
 }
