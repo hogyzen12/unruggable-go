@@ -127,6 +127,25 @@ func main() {
 		statusBar.SetText("")
 	}
 
+	// Add transaction inspector function
+	sidebar.OnTxInspectorClicked = func() {
+		updateMainContent(ui.NewTransactionInspectorScreen(myWindow, myApp))
+		ui.GetGlobalState().SetCurrentView("txinspector")
+		statusBar.SetText("")
+	}
+
+	sidebar.OnMultisigCreateClicked = func() {
+		updateMainContent(ui.NewMultisigCreateScreen(myWindow))
+		ui.GetGlobalState().SetCurrentView("multisigcreate")
+		statusBar.SetText("")
+	}
+
+	sidebar.OnMultisigInfoClicked = func() {
+		updateMainContent(ui.NewMultisigInfoScreen(myWindow))
+		ui.GetGlobalState().SetCurrentView("multisiginfo")
+		statusBar.SetText("")
+	}
+
 	// Start with the wallet screen as the default view
 	sidebar.OnWalletClicked()
 

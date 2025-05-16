@@ -16,6 +16,9 @@ type Sidebar struct {
 	OnCalypsoClicked        func()
 	OnConditionalBotClicked func() // New field for Conditional Bot
 	OnHardwareSignClicked   func() // New field for Conditional Bot
+	OnTxInspectorClicked    func()
+	OnMultisigCreateClicked func()
+	OnMultisigInfoClicked   func()
 }
 
 func NewSidebar() *Sidebar {
@@ -56,13 +59,34 @@ func (s *Sidebar) CreateRenderer() fyne.WidgetRenderer {
 		}
 	})
 
+	txInspectorBtn := widget.NewButton("Tx Inspector", func() {
+		if s.OnTxInspectorClicked != nil {
+			s.OnTxInspectorClicked()
+		}
+	})
+
+	OnMultisigCreateClickedBtn := widget.NewButton("Squads Create", func() {
+		if s.OnMultisigCreateClicked != nil {
+			s.OnMultisigCreateClicked()
+		}
+	})
+
+	infoBtn := widget.NewButton("Multisig Info", func() {
+		if s.OnMultisigInfoClicked != nil {
+			s.OnMultisigInfoClicked()
+		}
+	})
+
 	content := container.NewVBox(
 		homeBtn,
 		sendBtn,
 		walletBtn,
 		calypsoBtn,
 		conditionalBotBtn,
-		hardwareSignBtn)
+		hardwareSignBtn,
+		txInspectorBtn,
+		OnMultisigCreateClickedBtn,
+		infoBtn)
 
 	return widget.NewSimpleRenderer(content)
 }
